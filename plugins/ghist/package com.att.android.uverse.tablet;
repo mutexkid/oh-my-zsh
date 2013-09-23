@@ -1,0 +1,352 @@
+package com.att.android.uverse.tablet;
+
+import android.app.Activity;
+import android.app.AlertDialog;
+import android.app.FragmentManager;
+import android.content.DialogInterface;
+import android.text.TextUtils;
+import android.view.View;
+import android.widget.Toast;
+import com.att.android.uverse.Channel;
+import com.att.android.uverse.EPGShowBroadcast;
+import com.att.android.uverse.ParentalControl;
+import com.att.android.uverse.tablet.activities.ButtonHelper;
+import com.att.android.uverse.tablet.activities.onnow.PlayerState;
+import com.att.android.uverse.tablet.event.WatchNowClickEvent;
+import com.att.android.uverse.tablet.event.onnow.PinEntryEvent;
+import com.att.android.uverse.tablet.event.onnow.ShowBroadcastsChangedEvent;
+import com.att.android.uverse.tablet.quickplay.QuickPlayManager;
+import com.att.android.uverse.tablet.remote.RemoteConnector;
+import com.att.android.uverse.tablet.widget.WatchNowView;
+import com.att.android.uverse.util.Log;
+import com.att.labs.uversetv.android.tablet.R;
+import com.att.uve.SetTopBox;
+import com.att.uve.uveException;
+import com.google.inject.Inject;
+import com.squareup.otto.Bus;
+import com.squareup.otto.Subscribe;
+
+public class WatchNowController implements LifecycleListener {
+    private static final String TAG = "WatchNowController";
+    public static final int REQUEST_PIN = 0;
+    public static final String DIALOG_TAG_WATCH_LIVE_PARENTAL_CONTROL_PIN = "WatchNowController.dialogParentalControlsPin";
+    public static final String DIALOG_TAG_WATCH_NOW_SELECT_DEVICE = "WatchNowController.dialogWatchNowSelectDevice";
+    private ParentalControlsController parentalControlsController;
+    private QuickPlayManager qpManager;
+    private Bus eventBus;
+    private RemoteConnector remoteConnector;
+    private boolean registeredOnBus = false;
+    private EPGShowBroadcast showBroadcast;
+    private Channel channel;
+    private WatchNowView watchNowView;
+    private Activity activity;
+    private boolean stbViewingEnabled;
+    private WatchMode watchMode;
+    private UnlockedShowsList unlockedShows;
+    private CellularStreamingWarning cellularStreamingWarning;
+
+    /**
+     * WatchMode represents what the user's options are for playing a particular show.  This class uses the mode
+     * to determine and set the visility of the Watch button and receiver text, and also to determine what to do when
+     * the Watch button is clicked.
+     * Default WatchMode is NONE (meaning the button will not display).
+     */
+    private static enum WatchMode {
+        TABLET_ONLY, TABLET_OR_STB, STB_SINGLE, STB_MULTIPLE, NONE
+    }
+
+    @Inject
+    public WatchNowController(ParentalControlsController parentalControlsController,
+                              Bus bus,
+                              RemoteConnector remoteConnector,
+                              UnlockedShowsList unlockedShows,
+                              QuickPlayManager qpManager,
+                              PlayerState playerState
+    ) {
+        this.parentalControlsController = parentalControlsController;
+        this.eventBus = bus;
+        this.qpManager = qpManager;
+        this.remoteConnector = remoteConnector;
+        this.stbViewingEnabled = false;
+        this.unlockedShows = unlockedShows;
+        this.watchMode = WatchMode.NONE;
+    }
+
+    // Lifecycle listener method implementations
+    public void onStart() {
+        remoteConnector.addListener(STBconnectorListener);
+    }
+
+    public void onStop() {
+        remoteConnector.removeListener(STBconnectorListener);
+    }
+
+    //fragments/activities that use the recoding controller to leverage record functionality should call this method
+    //to make sure this controller is notified when the "hosting" activity/fragment's onStart/onStop methods are
+    //executed
+    public void setLifecycleObservable(LifecycleObservable lifecycleObservable){
+        if (lifecycleObservable == null){
+            Log.d(TAG, "No lifecycle observable");
+            disconnectLifecycleObservable();
+            return;
+        }
+
+        Log.d(TAG, "Register with the event bus");
+        activity = lifecycleObservable.getActivity();
+        eventBus.register(this);
+        registeredOnBus = true;
+    }
+
+    public void disconnectLifecycleObservable(){
+        Log.d(TAG, "Unregister from the event bus");
+        this.activity = null;
+        if (registeredOnBus) {
+            eventBus.unregister(this);
+            registeredOnBus = false;
+        }
+    }
+
+    public void setCellularStreamingWarning(CellularStreamingWarning cellularStreamingWarning) {
+        this.cellularStreamingWarning = cellularStreamingWarning;
+    }
+
+    public void setWatchNowView(WatchNowView watchNowView) {
+        this.watchNowView = watchNowView;
+        setWatchNowButtonListener();
+    }
+
+    public void setEPGShowBroadcast(EPGShowBroadcast showBroadcast) {
+        this.showBroadcast = showBroadcast;
+    }
+
+    public EPGShowBroadcast getShowBroadcast() {
+        return showBroadcast;
+    }
+
+    public void setChannel(Channel channel) {
+        this.channel = channel;
+    }
+
+    public Channel getChannel() {
+        return channel;
+    }
+
+    public boolean isLiveChannel() {
+        if (channel != null) {
+            return channel.isLive();
+        }
+        return false;
+    }
+
+    public void setSTBViewingEnabled(boolean stbViewingEnabled){
+        this.stbViewingEnabled = stbViewingEnabled;
+    }
+
+    public boolean isSTBViewingEnabled(){
+        return this.stbViewingEnabled;
+    }
+
+    public boolean showBroadcastIsRestricted() {
+        return parentalControlsController.showRestrictedForCurrentAccount(getShowBroadcast());
+    }
+
+    public boolean liveEnabledForAccount() {
+        return parentalControlsController.liveEnabledForCurrentAccount();
+    }
+
+    public boolean vodEnabledForAccount() {
+        return parentalControlsController.vodEnabledForCurrentAccount();
+    }
+
+    private void setWatchNowButtonListener() {
+        watchNowView.setWatchNowButtonClickListener(watchNowButtonClickListener);
+    }
+
+    public boolean showNotStreamable(){
+        if(mPlayerState == null){
+            return false;
+        }
+        return mPlayerState.selectedShowNotStreamable();
+    }
+
+    public void updateWatchMode(){
+
+        if (mPlayerState.getSelectedShowBroadcast() == null || mPlayerState.getSelectedChannel() == null) {
+            //this handles corner case when intermediate view is initialized from guide without a channel or show
+            watchMode = WatchMode.NONE;
+            return;
+        }
+
+        boolean showTimeIsNow = ButtonHelper.onNow(mPlayerState.getSelectedShowBroadcast().getStartTime(), mPlayerState.getSelectedShowBroadcast().getEndTime());
+        boolean liveStreamingAvailable = isLiveChannel() && showTimeIsNow && liveEnabledForAccount();
+        String receiverName = remoteConnector.requestReceiverName();
+        boolean pairedWithReceiver = !TextUtils.isEmpty(receiverName);
+        boolean multipleReceiversAvailable = remoteConnector.getConnectableSTBs().size() > 1;
+        boolean stbAvailable = stbViewingEnabled & (pairedWithReceiver || remoteConnector.getConnectableSTBs().size() > 0);
+
+        if(!showTimeIsNow ||
+                (!stbAvailable && !liveStreamingAvailable) ||
+                parentalControlsController.filterMatureShowForCurrentAccount(showBroadcast) ||
+                showNotStreamable()
+                ) {
+            watchMode = WatchMode.NONE;
+            return;
+        }
+
+        if (stbAvailable && liveStreamingAvailable) {  //pop up selector with live streaming option available
+            watchMode = WatchMode.TABLET_OR_STB;
+        } else if (stbAvailable && !liveStreamingAvailable) {
+            watchMode = multipleReceiversAvailable ? WatchMode.STB_MULTIPLE : WatchMode.STB_SINGLE;
+        } else if (!stbAvailable && liveStreamingAvailable) {
+            watchMode = WatchMode.TABLET_ONLY;
+        }
+    }
+
+    public void updateWatchNowView(){
+        updateWatchMode();
+        switch (watchMode) {
+
+            case NONE:
+                watchNowView.setVisibility(View.GONE);
+                break;
+
+            case TABLET_ONLY:
+                watchNowView.setWatchNowButtonText("Watch on Tablet");
+                watchNowView.setVisibility(View.VISIBLE);
+                watchNowView.setReceiverText("");
+                watchNowView.setLiveIconVisibility(false);
+                break;
+
+            case STB_SINGLE:
+            case STB_MULTIPLE:
+                watchNowView.setWatchNowButtonText("Watch on TV");
+                watchNowView.setVisibility(View.VISIBLE);
+                watchNowView.setReceiverText(remoteConnector.requestReceiverName());
+                watchNowView.setLiveIconVisibility(false);
+                break;
+
+            case TABLET_OR_STB:
+                watchNowView.setWatchNowButtonText("Watch");
+                watchNowView.setVisibility(View.VISIBLE);
+                watchNowView.setReceiverText(remoteConnector.requestReceiverName());
+                watchNowView.setLiveIconVisibility(true);
+                break;
+        }
+    }
+
+    private View.OnClickListener watchNowButtonClickListener = new View.OnClickListener() {
+        @Override
+        public void onClick(View view) {
+            if (cellularStreamingWarning.shouldWarnAboutCellularStreaming()) {
+                AlertDialog dialog = new AlertDialog.Builder(activity).create();
+                dialog.setTitle(R.string.cellular_warning_popup_title);
+                dialog.setMessage(activity.getString(R.string.cellular_warning_popup_content, mPlayerState.getSelectedShowBroadcast().getTitle()));
+                dialog.setCancelable(false);
+                dialog.setButton(DialogInterface.BUTTON_POSITIVE, activity.getString(R.string.cellular_warning_popup_ok_button), new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialogInterface, int i) {
+                        cellularStreamingWarning.warnedUserNow();
+                        handleWatchButtonClick();
+                    }
+                });
+                dialog.setButton(DialogInterface.BUTTON_NEGATIVE, activity.getString(R.string.cellular_warning_popup_cancel_button), new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialogInterface, int i) {
+                    }
+                });
+                dialog.show();
+            } else {
+                handleWatchButtonClick();
+            }
+        }
+    };
+
+
+    private void handleWatchButtonClick() {
+        switch (watchMode) {
+
+            case TABLET_ONLY:
+
+                if (isShowRestricted()) {
+                    Log.d(TAG, "Tablet Only, show restricted - show pin dialog fragment");
+                    showPinDialogFragment();
+                }  else {
+                    Log.d(TAG, "Tablet Only - send watch now event");
+                    sendWatchNowEvent();
+                }
+
+                break;
+
+            case STB_MULTIPLE:
+                //display selector dialog listing available set top boxes; once a STB is selected, tune the TV
+                Log.d(TAG, "STB_MULTIPLE - show WatchNowDialog");
+                showWatchNowDialogFragment(false);
+                break;
+
+            case STB_SINGLE:
+                //tune TV to channel
+                break;
+
+            case TABLET_OR_STB:
+                Log.d(TAG, "TABLET_OR_STB - show WatchNowDialog");
+                showWatchNowDialogFragment(true);
+                break;
+        }
+    }
+
+    public boolean isShowRestricted(){
+        //todo: update based on new parental controls/blackout status checks
+        return parentalControlsController.showRestrictedForCurrentAccount(mPlayerState.getSelectedShowBroadcast()) && !unlockedShows.showUnlocked(showBroadcast.getBroadcastID());
+    }
+
+    private void sendWatchNowEvent() {
+        eventBus.post(new WatchNowClickEvent(mPlayerState.getSelectedShowBroadcast(), mPlayerState.getSelectedChannel()));
+    }
+
+
+    private void showPinDialogFragment() {
+        FragmentManager fm = activity.getFragmentManager();
+        ParentalControlPinDialogFragment pinDialog = ParentalControlPinDialogFragment.newInstance();
+        pinDialog.show(fm, DIALOG_TAG_WATCH_LIVE_PARENTAL_CONTROL_PIN);
+    }
+
+    private void showWatchNowDialogFragment(boolean isTabletStreamingEnabled){
+        WatchNowDialogFragment watchNowDialogFragment = WatchNowDialogFragment.newInstance(isTabletStreamingEnabled);
+        watchNowDialogFragment.setChannel(mPlayerState.getSelectedChannel());
+        watchNowDialogFragment.setShowBroadcast(mPlayerState.getSelectedShowBroadcast());
+        watchNowDialogFragment.show(activity.getFragmentManager(), DIALOG_TAG_WATCH_NOW_SELECT_DEVICE);
+    }
+
+    @Subscribe
+    public void onPinEntryEvent(ParentalControlPinDialogFragment.PinResult result) {
+        String pinValue = result.getResult();
+        ParentalControl masterUserControl = parentalControlsController.getMasterAccount();
+        if (masterUserControl != null) {
+            if (pinValue.equals(masterUserControl.getPin())) {
+                PinEntryEvent pinEntryEvent = new PinEntryEvent(pinValue);
+                eventBus.post(pinEntryEvent);
+                sendWatchNowEvent();
+            } else {
+                Toast.makeText(activity, R.string.parental_controls_invalid_pin_entry, Toast.LENGTH_SHORT).show();
+            }
+        }
+    }
+
+    private RemoteConnector.StateChangeListener STBconnectorListener = new RemoteConnector.StateChangeListener() {
+        public void onStateChanged(RemoteConnector connector, RemoteConnector.ConnectionState state) {
+            updateWatchNowView();
+        }
+
+        public void onSTBStateChanged(SetTopBox box, SetTopBox.STBState state) {
+            updateWatchNowView();
+        }
+
+        public void onSetTopBoxError(SetTopBox box, uveException exception) {
+
+        }
+
+        public void onSTBBoxesUpdated() {
+            updateWatchNowView();
+        }
+    };
+}
